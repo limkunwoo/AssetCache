@@ -1,0 +1,19 @@
+# UE plugin build artifacts
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.bak
+*.swp
+*.log
