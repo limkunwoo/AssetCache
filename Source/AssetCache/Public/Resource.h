@@ -9,23 +9,40 @@ class UAssetCacheManager;
 /**
  * namespace Resource — 에셋 로딩 진입점.
  *
- * 사용 예:
+ * Single-path:
  *   Resource::Load("/Game/Meshes/SM_Chair").Get<UStaticMesh>();
- *   Resource::Load(SoftPath).SkipCache().OnComplete<UTexture2D>([](auto* T, auto& Ctx){ });
- *   Resource::Load(Path).AbortIfInvalid(this).Then<UAnimSequence>();
+ *   Resource::Load(SoftPath).SkipCache().OnComplete<UTexture2D>([](UTexture2D* T){ });
+ *
+ * Multi-path:
+ *   Resource::Load({P1, P2, P3}).GetAll<UStaticMesh>();
+ *   Resource::Load(SoftPtrArray).OnCompleteAll<UTexture2D>([](TArray<UTexture2D*> Ts){ });
  */
 namespace Resource
 {
-	/** FSoftObjectPath로 로드 요청 빌더 생성 */
-	ASSETCACHE_API FLoadRequest Load(const FSoftObjectPath& InPath);
+	// ─── Single-path ────────────────────────────────────────
 
-	/** 문자열 경로로 로드 요청 빌더 생성 */
+	ASSETCACHE_API FLoadRequest Load(const FSoftObjectPath& InPath);
 	ASSETCACHE_API FLoadRequest Load(const TCHAR* InPath);
 
-	/** TSoftObjectPtr에서 로드 요청 빌더 생성 */
 	template<typename T>
 	FLoadRequest Load(const TSoftObjectPtr<T>& InPtr)
 	{
 		return Load(InPtr.ToSoftObjectPath());
+	}
+
+	// ─── Multi-path ─────────────────────────────────────────
+
+	ASSETCACHE_API FLoadRequest Load(TArray<FSoftObjectPath> InPaths);
+
+	template<typename T>
+	FLoadRequest Load(const TArray<TSoftObjectPtr<T>>& InPtrs)
+	{
+		TArray<FSoftObjectPath> Paths;
+		Paths.Reserve(InPtrs.Num());
+		for (const TSoftObjectPtr<T>& Ptr : InPtrs)
+		{
+			Paths.Add(Ptr.ToSoftObjectPath());
+		}
+		return Load(MoveTemp(Paths));
 	}
 }

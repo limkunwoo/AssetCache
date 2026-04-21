@@ -12,4 +12,9 @@ namespace Resource
 	{
 		return Load(FSoftObjectPath(InPath));
 	}
+
+	FLoadRequest Load(TArray<FSoftObjectPath> InPaths)
+	{
+		return FLoadRequest(UAssetCacheManager::Get(), MoveTemp(InPaths));
+	}
 }
