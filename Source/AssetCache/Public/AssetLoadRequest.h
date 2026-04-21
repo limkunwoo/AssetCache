@@ -3,9 +3,12 @@
 #include "CoreMinimal.h"
 #include "UObject/SoftObjectPath.h"
 #include "Engine/StreamableManager.h"
+#include "Templates/Invoke.h"
 #include "AssetCacheTypes.h"
 #include "ExpectedFuture.h"
 #include "FutureExtensions.h"
+
+#include <type_traits>
 
 class UAssetCacheManager;
 
@@ -17,6 +20,9 @@ class UAssetCacheManager;
  * 사용 예:
  *   Resource::Load(Path).Get<UStaticMesh>();
  *   Resource::Load(Path).SkipCache().OnComplete<UTexture2D>([](auto* T, auto& Ctx){ });
+ *   Resource::Load(Path).Then<UStaticMesh>([](UStaticMesh* M, const FAssetLoadContext& Ctx){
+ *       return SomeValue;
+ *   }).Then([](SD::TExpected<X> R){ ... });
  *   auto Req = Resource::Load(Path).AbortIfInvalid(this);
  *   Req.OnComplete<UStaticMesh>([](auto* M, auto& Ctx){ });
  *   Req.Cancel();
@@ -50,9 +56,26 @@ struct ASSETCACHE_API FLoadRequest
 	template<typename T = UObject>
 	void OnComplete(TFunction<void(T*, const FAssetLoadContext&)> Callback);
 
-	/** 비동기 로드 + Future 체인 */
+	/** 비동기 로드 + Future 체인 (raw future) */
 	template<typename T = UObject>
 	SD::TExpectedFuture<T*> Then();
+
+	/**
+	 * 비동기 로드 + 람다 + Future 체인.
+	 *
+	 * 람다는 (T* Asset, const FAssetLoadContext& Ctx) 시그니처여야 한다.
+	 * - Asset이 null이거나 캐스팅 실패 시 T*는 nullptr로 전달된다 (Ctx로 원인 확인 가능).
+	 * - 람다 반환값은 다음 Future로 그대로 넘겨져 SD 체인이 가능하다.
+	 * - 람다가 void를 반환하면 TExpectedFuture<void>가 반환된다.
+	 *
+	 * 예:
+	 *   Resource::Load(Path).Then<UStaticMesh>([](UStaticMesh* M, const FAssetLoadContext& Ctx){
+	 *       return M ? M->GetName() : FString();
+	 *   }).Then([](SD::TExpected<FString> R){ ... });
+	 */
+	template<typename T = UObject, typename F>
+	auto Then(F&& Func)
+		-> SD::TExpectedFuture<TInvokeResult_T<F, T*, const FAssetLoadContext&>>;
 
 	// ─── 제어 ────────────────────────────────────────────────
 
@@ -126,6 +149,32 @@ SD::TExpectedFuture<T*> FLoadRequest::Then()
 		{
 			Promise->SetValue(SD::Error(-2, FString::Printf(
 				TEXT("Asset load failed: %s"), *Ctx.AssetPath.ToString())));
+		}
+	});
+
+	return Promise->GetFuture();
+}
+
+template<typename T, typename F>
+auto FLoadRequest::Then(F&& Func)
+	-> SD::TExpectedFuture<TInvokeResult_T<F, T*, const FAssetLoadContext&>>
+{
+	using LambdaResult = TInvokeResult_T<F, T*, const FAssetLoadContext&>;
+
+	auto Promise = MakeShared<SD::TExpectedPromise<LambdaResult>>();
+
+	ExecuteAsync([Promise, Func = Forward<F>(Func)](UObject* Obj, const FAssetLoadContext& Ctx) mutable
+	{
+		T* Typed = Cast<T>(Obj);
+
+		if constexpr (std::is_void_v<LambdaResult>)
+		{
+			::Invoke(Func, Typed, Ctx);
+			Promise->SetValue();
+		}
+		else
+		{
+			Promise->SetValue(::Invoke(Func, Typed, Ctx));
 		}
 	});
 
