@@ -35,8 +35,7 @@ void UAssetCacheManager::Initialize(FSubsystemCollectionBase& Collection)
 
 	ProfileCollector = MakeUnique<FAssetProfileCollector>();
 
-	const UAssetCacheSettings* Settings = UAssetCacheSettings::Get();
-	if (Settings)
+	if (const UAssetCacheSettings* Settings = UAssetCacheSettings::Get())
 	{
 		ProfileCollector->SetMaxRecords(Settings->MaxProfileRecords);
 	}
@@ -79,41 +78,50 @@ void UAssetCacheManager::Deinitialize()
 void UAssetCacheManager::InitPoliciesFromSettings()
 {
 	const UAssetCacheSettings* Settings = UAssetCacheSettings::Get();
-	if (!Settings) { return; }
+	if (!Settings)
+	{
+		return;
+	}
 
 	for (const auto& Pair : Settings->ClassPolicyMap)
 	{
 		UClass* ResolvedClass = Pair.Key.LoadSynchronous();
-		if (!ResolvedClass) { continue; }
-
-		if (Pair.Value.IsValid())
+		if (!ResolvedClass)
 		{
-			if (const FCachePolicyFactoryBase* Factory = Pair.Value.GetPtr<FCachePolicyFactoryBase>())
-			{
-				TSharedPtr<IAssetCachePolicy> Policy = Factory->Create();
-				if (Policy.IsValid())
-				{
-					ClassPolicyMap.Add(ResolvedClass, Policy);
-					UE_LOG(LogAssetCache, Log, TEXT("  Class policy: %s -> %s"),
-						*ResolvedClass->GetName(), *Policy->GetDescription());
-				}
-			}
+			continue;
 		}
+
+		if (!Pair.Value.IsValid())
+		{
+			continue;
+		}
+
+		const FCachePolicyFactoryBase* Factory = Pair.Value.GetPtr<FCachePolicyFactoryBase>();
+		if (!Factory)
+		{
+			continue;
+		}
+
+		TSharedPtr<IAssetCachePolicy> Policy = Factory->Create();
+		if (!Policy.IsValid())
+		{
+			continue;
+		}
+
+		ClassPolicyMap.Add(ResolvedClass, Policy);
+		UE_LOG(LogAssetCache, Log, TEXT("  Class policy: %s -> %s"),
+			*ResolvedClass->GetName(), *Policy->GetDescription());
 	}
 }
 
 IAssetCachePolicy* UAssetCacheManager::FindPolicyForClass(UClass* AssetClass) const
 {
-	if (!AssetClass) { return nullptr; }
-
-	UClass* TestClass = AssetClass;
-	while (TestClass)
+	for (UClass* TestClass = AssetClass; TestClass; TestClass = TestClass->GetSuperClass())
 	{
 		if (const TSharedPtr<IAssetCachePolicy>* Found = ClassPolicyMap.Find(TestClass))
 		{
 			return Found->Get();
 		}
-		TestClass = TestClass->GetSuperClass();
 	}
 	return nullptr;
 }
@@ -126,20 +134,26 @@ UObject* UAssetCacheManager::FindCached(const FSoftObjectPath& AssetPath) const
 {
 	check(IsInGameThread());
 
-	// We need the asset's class to find the right policy.
-	// If the asset is resident, we can check its class.
-	// Otherwise we can't determine which policy to use → return nullptr.
+	// 정책 lookup에 클래스가 필요 → resident가 아니면 어떤 정책을 적용할지 모르므로 미스 처리.
 	UObject* Existing = AssetPath.ResolveObject();
-	if (!Existing) { return nullptr; }
+	if (!Existing)
+	{
+		return nullptr;
+	}
 
 	IAssetCachePolicy* Policy = FindPolicyForClass(Existing->GetClass());
-	if (!Policy) { return nullptr; }
+	if (!Policy)
+	{
+		return nullptr;
+	}
 
 	UObject* Cached = Policy->Find(AssetPath);
-	if (Cached)
+	if (!Cached)
 	{
-		Policy->OnHit(AssetPath);
+		return nullptr;
 	}
+
+	Policy->OnHit(AssetPath);
 	return Cached;
 }
 
@@ -147,21 +161,25 @@ void UAssetCacheManager::CommitLoadResult(const FAssetLoadContext& Context)
 {
 	check(IsInGameThread());
 
-	// Record profiling
+	// 1) 프로파일 기록
 	if (ProfileCollector.IsValid())
 	{
 		ProfileCollector->RecordLoad(Context);
 	}
 
-	// Store in cache if we have a loaded object and a matching policy
-	if (Context.Loaded && Context.Result != EAssetLoadResult::CacheHit)
+	// 2) 캐시 저장 — Loaded 없거나 이미 CacheHit이면 skip
+	if (!Context.Loaded || Context.Result == EAssetLoadResult::CacheHit)
 	{
-		IAssetCachePolicy* Policy = FindPolicyForClass(Context.Loaded->GetClass());
-		if (Policy)
-		{
-			Policy->OnMiss(Context.AssetPath, Context.Loaded);
-		}
+		return;
 	}
+
+	IAssetCachePolicy* Policy = FindPolicyForClass(Context.Loaded->GetClass());
+	if (!Policy)
+	{
+		return;
+	}
+
+	Policy->OnMiss(Context.AssetPath, Context.Loaded);
 }
 
 void UAssetCacheManager::MarkPendingLoadRequest(const FSoftObjectPath& AssetPath)
@@ -178,6 +196,7 @@ void UAssetCacheManager::UnmarkPendingLoadRequest(const FSoftObjectPath& AssetPa
 
 void UAssetCacheManager::OnGlobalAssetLoaded(UObject* Asset)
 {
+	// 비게임스레드에서 들어오면 게임스레드로 던지고 종료
 	if (!IsInGameThread())
 	{
 		TWeakObjectPtr<UAssetCacheManager> WeakThis(this);
@@ -192,8 +211,6 @@ void UAssetCacheManager::OnGlobalAssetLoaded(UObject* Asset)
 		return;
 	}
 
-	check(IsInGameThread());
-
 	if (!Asset)
 	{
 		return;
@@ -205,6 +222,7 @@ void UAssetCacheManager::OnGlobalAssetLoaded(UObject* Asset)
 		return;
 	}
 
+	// FLoadRequest 경로에서 이미 처리 중이면 중복 기록 방지
 	if (PendingLoadRequestPaths.Contains(AssetPath))
 	{
 		return;
@@ -216,6 +234,7 @@ void UAssetCacheManager::OnGlobalAssetLoaded(UObject* Asset)
 		return;
 	}
 
+	// 이미 캐시에 있는 동일 path면 skip
 	if (Policy->Find(AssetPath) != nullptr)
 	{
 		return;
@@ -227,15 +246,14 @@ void UAssetCacheManager::OnGlobalAssetLoaded(UObject* Asset)
 	Context.Result = EAssetLoadResult::MissAndLoad;
 	Context.ProfileTier = EProfileTier::Observed;
 
-	if (const UPackage* Package = Asset->GetOutermost())
+	// 패키지 시작 이벤트가 있었다면 elapsed/async 정보 채우기
+	const UPackage* Package = Asset->GetOutermost();
+	const FName PackageName = Package ? Package->GetFName() : NAME_None;
+	if (FObservedPackageLoadInfo* LoadInfo = (PackageName.IsNone() ? nullptr : PendingPackageLoads.Find(PackageName)))
 	{
-		const FName PackageName = Package->GetFName();
-		if (const FObservedPackageLoadInfo* LoadInfo = PendingPackageLoads.Find(PackageName))
-		{
-			Context.LoadTimeSec = static_cast<float>(FPlatformTime::Seconds() - LoadInfo->StartTimeSec);
-			Context.bIsAsync = LoadInfo->bIsAsync;
-			PendingPackageLoads.Remove(PackageName);
-		}
+		Context.LoadTimeSec = static_cast<float>(FPlatformTime::Seconds() - LoadInfo->StartTimeSec);
+		Context.bIsAsync = LoadInfo->bIsAsync;
+		PendingPackageLoads.Remove(PackageName);
 	}
 
 	CommitLoadResult(Context);
@@ -269,10 +287,11 @@ void UAssetCacheManager::FlushAllCaches()
 
 	for (auto& Pair : ClassPolicyMap)
 	{
-		if (Pair.Value.IsValid())
+		if (!Pair.Value.IsValid())
 		{
-			Pair.Value->Flush();
+			continue;
 		}
+		Pair.Value->Flush();
 	}
 }
 
@@ -292,16 +311,18 @@ double UAssetCacheManager::GetAverageLoadTime() const
 
 void UAssetCacheManager::DumpProfileStats() const
 {
-	if (ProfileCollector.IsValid())
+	if (!ProfileCollector.IsValid())
 	{
-		ProfileCollector->DumpStats();
+		return;
 	}
+	ProfileCollector->DumpStats();
 }
 
 void UAssetCacheManager::ResetProfileData()
 {
-	if (ProfileCollector.IsValid())
+	if (!ProfileCollector.IsValid())
 	{
-		ProfileCollector->Reset();
+		return;
 	}
+	ProfileCollector->Reset();
 }
