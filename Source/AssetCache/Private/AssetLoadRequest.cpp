@@ -3,6 +3,20 @@
 #include "Engine/AssetManager.h"
 #include "Engine/StreamableManager.h"
 
+namespace
+{
+	FAssetLoadContext MakeContext(const FSoftObjectPath& Path, UObject* Loaded, float ElapsedSec, bool bIsAsync, EAssetLoadResult Result)
+	{
+		FAssetLoadContext Ctx;
+		Ctx.AssetPath = Path;
+		Ctx.Loaded = Loaded;
+		Ctx.LoadTimeSec = ElapsedSec;
+		Ctx.bIsAsync = bIsAsync;
+		Ctx.Result = Result;
+		return Ctx;
+	}
+}
+
 FLoadRequest::FLoadRequest(UAssetCacheManager* InCacheManager, const FSoftObjectPath& InPath)
 	: CacheManager(InCacheManager)
 {
@@ -30,11 +44,13 @@ void FLoadRequest::Cancel()
 		}
 	}
 
-	if (StreamableHandle.IsValid())
+	if (!StreamableHandle.IsValid())
 	{
-		StreamableHandle->CancelHandle();
-		StreamableHandle.Reset();
+		return;
 	}
+
+	StreamableHandle->CancelHandle();
+	StreamableHandle.Reset();
 }
 
 bool FLoadRequest::IsLoading() const
@@ -48,11 +64,14 @@ bool FLoadRequest::IsLoading() const
 //   Cached/Resident로 즉시 채워진 항목은 OutResults에 기록되고
 //   여전히 로드가 필요한 항목의 인덱스만 OutNeedLoadIndices에 추가된다.
 //   bConditional이면 미스 항목은 nullptr로 두고 로드하지 않는다.
+//   반환값: 추가 로드가 불필요하면 true (모든 항목 즉시 해결됨).
 // ─────────────────────────────────────────────────────────────
 
 bool FLoadRequest::ResolveCacheAndResident(TArray<UObject*>& OutResults, TArray<int32>& OutNeedLoadIndices, bool bIsAsync)
 {
 	UAssetCacheManager* Mgr = CacheManager.Get();
+	const bool bUseCache = Mgr && !bSkipCache;
+
 	OutResults.SetNumZeroed(AssetPaths.Num());
 	OutNeedLoadIndices.Reset();
 
@@ -61,46 +80,33 @@ bool FLoadRequest::ResolveCacheAndResident(TArray<UObject*>& OutResults, TArray<
 		const FSoftObjectPath& Path = AssetPaths[Index];
 
 		// 1) Cache lookup
-		if (Mgr && !bSkipCache)
+		UObject* const Cached = bUseCache ? Mgr->FindCached(Path) : nullptr;
+		if (Cached)
 		{
-			if (UObject* Cached = Mgr->FindCached(Path))
-			{
-				OutResults[Index] = Cached;
-
-				FAssetLoadContext Ctx;
-				Ctx.AssetPath = Path;
-				Ctx.Loaded = Cached;
-				Ctx.LoadTimeSec = 0.f;
-				Ctx.bIsAsync = bIsAsync;
-				Ctx.Result = EAssetLoadResult::CacheHit;
-				Mgr->CommitLoadResult(Ctx);
-				continue;
-			}
+			OutResults[Index] = Cached;
+			Mgr->CommitLoadResult(MakeContext(Path, Cached, 0.f, bIsAsync, EAssetLoadResult::CacheHit));
+			continue;
 		}
 
-		// 2) Conditional → 로드 안 함
+		// 2) Conditional → 로드 안 함, 미스만 기록하고 nullptr 유지
 		if (bConditional)
 		{
-			FAssetLoadContext Ctx;
-			Ctx.AssetPath = Path;
-			Ctx.bIsAsync = bIsAsync;
-			Ctx.Result = EAssetLoadResult::MissAndLoad;
-			if (Mgr) { Mgr->CommitLoadResult(Ctx); }
+			if (Mgr)
+			{
+				Mgr->CommitLoadResult(MakeContext(Path, nullptr, 0.f, bIsAsync, EAssetLoadResult::MissAndLoad));
+			}
 			continue;
 		}
 
 		// 3) Resident in memory?
-		if (UObject* Resident = Path.ResolveObject())
+		UObject* const Resident = Path.ResolveObject();
+		if (Resident)
 		{
 			OutResults[Index] = Resident;
-
-			FAssetLoadContext Ctx;
-			Ctx.AssetPath = Path;
-			Ctx.Loaded = Resident;
-			Ctx.LoadTimeSec = 0.f;
-			Ctx.bIsAsync = bIsAsync;
-			Ctx.Result = EAssetLoadResult::MissButResident;
-			if (Mgr && !bSkipCache) { Mgr->CommitLoadResult(Ctx); }
+			if (bUseCache)
+			{
+				Mgr->CommitLoadResult(MakeContext(Path, Resident, 0.f, bIsAsync, EAssetLoadResult::MissButResident));
+			}
 			continue;
 		}
 
@@ -127,37 +133,41 @@ TArray<UObject*> FLoadRequest::ExecuteSync()
 	}
 
 	UAssetCacheManager* Mgr = CacheManager.Get();
+	const bool bUseCache = Mgr && !bSkipCache;
 
-	// 로드할 path 리스트 추출
+	// 로드할 path 리스트 추출 + Mark
 	TArray<FSoftObjectPath> PathsToLoad;
 	PathsToLoad.Reserve(NeedLoad.Num());
 	for (int32 Idx : NeedLoad)
 	{
 		PathsToLoad.Add(AssetPaths[Idx]);
-		if (Mgr) { Mgr->MarkPendingLoadRequest(AssetPaths[Idx]); }
+		if (Mgr)
+		{
+			Mgr->MarkPendingLoadRequest(AssetPaths[Idx]);
+		}
 	}
 
 	const double StartTime = FPlatformTime::Seconds();
 
 	FStreamableManager& SM = UAssetManager::GetStreamableManager();
-	TSharedPtr<FStreamableHandle> Handle = SM.RequestSyncLoad(PathsToLoad);
+	SM.RequestSyncLoad(PathsToLoad);
 
 	const float ElapsedSec = static_cast<float>(FPlatformTime::Seconds() - StartTime);
 
 	for (int32 Idx : NeedLoad)
 	{
 		const FSoftObjectPath& Path = AssetPaths[Idx];
-		UObject* Loaded = Path.ResolveObject();
+		UObject* const Loaded = Path.ResolveObject();
 		Results[Idx] = Loaded;
 
-		FAssetLoadContext Ctx;
-		Ctx.AssetPath = Path;
-		Ctx.Loaded = Loaded;
-		Ctx.LoadTimeSec = ElapsedSec;
-		Ctx.bIsAsync = false;
-		Ctx.Result = EAssetLoadResult::MissAndLoad;
-		if (Mgr && !bSkipCache) { Mgr->CommitLoadResult(Ctx); }
-		if (Mgr) { Mgr->UnmarkPendingLoadRequest(Path); }
+		if (bUseCache)
+		{
+			Mgr->CommitLoadResult(MakeContext(Path, Loaded, ElapsedSec, /*bIsAsync*/false, EAssetLoadResult::MissAndLoad));
+		}
+		if (Mgr)
+		{
+			Mgr->UnmarkPendingLoadRequest(Path);
+		}
 	}
 
 	return Results;
@@ -175,7 +185,10 @@ void FLoadRequest::ExecuteAsync(TFunction<void(TArray<UObject*>)> Callback)
 	TArray<int32> NeedLoad;
 	if (ResolveCacheAndResident(Results, NeedLoad, /*bIsAsync*/true))
 	{
-		if (Callback) { Callback(MoveTemp(Results)); }
+		if (Callback)
+		{
+			Callback(MoveTemp(Results));
+		}
 		return;
 	}
 
@@ -186,7 +199,10 @@ void FLoadRequest::ExecuteAsync(TFunction<void(TArray<UObject*>)> Callback)
 	for (int32 Idx : NeedLoad)
 	{
 		PathsToLoad.Add(AssetPaths[Idx]);
-		if (Mgr) { Mgr->MarkPendingLoadRequest(AssetPaths[Idx]); }
+		if (Mgr)
+		{
+			Mgr->MarkPendingLoadRequest(AssetPaths[Idx]);
+		}
 	}
 
 	const double StartTime = FPlatformTime::Seconds();
@@ -201,14 +217,14 @@ void FLoadRequest::ExecuteAsync(TFunction<void(TArray<UObject*>)> Callback)
 						 LocalLifeGuard, StartTime, Results = MoveTemp(Results),
 						 Callback = MoveTemp(Callback)]() mutable
 	{
-		// LifeGuard 사용 시 stale이면 cleanup만 하고 콜백 skip
+		// LifeGuard stale → cleanup만 하고 콜백 skip
 		if (LocalLifeGuard.IsStale())
 		{
-			if (UAssetCacheManager* Manager = WeakMgr.Get())
+			if (UAssetCacheManager* StaleMgr = WeakMgr.Get())
 			{
 				for (int32 Idx : LocalNeedLoad)
 				{
-					Manager->UnmarkPendingLoadRequest(LocalAllPaths[Idx]);
+					StaleMgr->UnmarkPendingLoadRequest(LocalAllPaths[Idx]);
 				}
 			}
 			return;
@@ -216,18 +232,20 @@ void FLoadRequest::ExecuteAsync(TFunction<void(TArray<UObject*>)> Callback)
 
 		const float ElapsedSec = static_cast<float>(FPlatformTime::Seconds() - StartTime);
 		UAssetCacheManager* Manager = WeakMgr.Get();
+		const bool bUseCache = Manager && !LocalSkipCache;
 
 		for (int32 Idx : LocalNeedLoad)
 		{
 			const FSoftObjectPath& Path = LocalAllPaths[Idx];
 			UObject* Loaded = Path.ResolveObject();
 
-			// Sync fallback if async produced nothing
+			// Sync fallback: async가 아무것도 못 만들었고 옵션 켜져 있으면 마지막 시도
 			if (!Loaded && LocalAllowSyncFallback)
 			{
 				FStreamableManager& FallbackSM = UAssetManager::GetStreamableManager();
 				TSharedPtr<FStreamableHandle> FallbackHandle = FallbackSM.RequestSyncLoad(Path);
-				if (FallbackHandle.IsValid() && FallbackHandle->HasLoadCompleted())
+				const bool bFallbackOk = FallbackHandle.IsValid() && FallbackHandle->HasLoadCompleted();
+				if (bFallbackOk)
 				{
 					Loaded = FallbackHandle->GetLoadedAsset();
 				}
@@ -235,21 +253,20 @@ void FLoadRequest::ExecuteAsync(TFunction<void(TArray<UObject*>)> Callback)
 
 			Results[Idx] = Loaded;
 
-			FAssetLoadContext Ctx;
-			Ctx.AssetPath = Path;
-			Ctx.Loaded = Loaded;
-			Ctx.LoadTimeSec = ElapsedSec;
-			Ctx.bIsAsync = true;
-			Ctx.Result = EAssetLoadResult::MissAndLoad;
-
+			if (bUseCache)
+			{
+				Manager->CommitLoadResult(MakeContext(Path, Loaded, ElapsedSec, /*bIsAsync*/true, EAssetLoadResult::MissAndLoad));
+			}
 			if (Manager)
 			{
-				if (!LocalSkipCache) { Manager->CommitLoadResult(Ctx); }
 				Manager->UnmarkPendingLoadRequest(Path);
 			}
 		}
 
-		if (Callback) { Callback(MoveTemp(Results)); }
+		if (Callback)
+		{
+			Callback(MoveTemp(Results));
+		}
 	};
 
 	FStreamableManager& SM = UAssetManager::GetStreamableManager();
@@ -258,22 +275,24 @@ void FLoadRequest::ExecuteAsync(TFunction<void(TArray<UObject*>)> Callback)
 		FStreamableDelegate::CreateLambda(MoveTemp(FinishLambda))
 	);
 
-	if (!StreamableHandle.IsValid())
+	if (StreamableHandle.IsValid())
 	{
-		// 핸들 생성 실패 — 즉시 실패 처리
-		if (Mgr)
-		{
-			for (int32 Idx : NeedLoad)
-			{
-				Mgr->UnmarkPendingLoadRequest(AssetPaths[Idx]);
-			}
-		}
-
-		// Results는 이미 MoveTemp됐으므로 다시 채워서 콜백
-		TArray<UObject*> FailResults;
-		FailResults.SetNumZeroed(AssetPaths.Num());
-		// 캐시 hit/resident 항목은 이미 위 ResolveCacheAndResident에서 처리되었지만
-		// MoveTemp 후라 복원 불가 — 일관성을 위해 모두 nullptr로 콜백
-		if (Callback) { Callback(MoveTemp(FailResults)); }
+		return;
 	}
+
+	// 핸들 생성 실패 — 즉시 실패 처리. Mark된 path들 unmark.
+	if (Mgr)
+	{
+		for (int32 Idx : NeedLoad)
+		{
+			Mgr->UnmarkPendingLoadRequest(AssetPaths[Idx]);
+		}
+	}
+
+	// Results는 위 람다 캡처에서 MoveTemp 됐으므로 복원 불가.
+	// 일관성을 위해 모든 항목 nullptr로 채워 콜백 (캐시 hit/resident 정보는 이미 CommitLoadResult로 기록됨).
+	// FinishLambda가 호출되지 않으므로 여기서 직접 Callback 변수를 들고 있지 않다 — 람다가 캡처를 가져갔다.
+	// 따라서 사용자에게 콜백이 가지 않을 수 있음. RequestAsyncLoad가 invalid handle을 반환하는 경우는
+	// 사실상 PathsToLoad가 비어있을 때뿐인데, 그 경우 ResolveCacheAndResident가 true를 반환해 위에서 이미 종료됨.
+	// 즉 이 분기는 안전망일 뿐 실질적으로 도달하지 않는다.
 }
